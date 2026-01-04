@@ -1,0 +1,50 @@
+model:
+  yolo:
+    variant: "models/yolo/weights/best.pt"  # Using user-provided local weights
+    pretrained: false
+    img_size: 640
+
+# Notification configuration
+notification:
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  sender_email: "your_email@gmail.com"  # REPLACE WITH YOUR EMAIL
+  sender_password: "your_app_password"  # REPLACE WITH YOUR APP PASSWORD
+  receiver_emails: "receiver@example.com" # REPLACE WITH RECEIVER EMAIL
+  cooldown_seconds: 300  # 5 minutes
+
+# Training configuration
+training:
+  batch_size: 8
+  epochs: 50
+  learning_rate: 0.0001
+  weight_decay: 0.0001
+  patience: 15
+  warmup_epochs: 5
+  gradient_clip: 1.0
+  
+  # Focal Loss settings
+  use_focal_loss: true
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+  
+  # Weighted sampling
+  use_weighted_sampling: true
+  
+  # Data augmentation
+  augmentation:
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    degrees: 10
+    translate: 0.1
+    scale: 0.5
+    flipud: 0.5
+    mosaic: 1.0
+
+# Inference configuration
+inference:
+  device: "cuda"
+  batch_size: 1
+  confidence_threshold: 0.25  # Raised to reduce false positives
+  nms_threshold: 0.45
