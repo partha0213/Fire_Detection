@@ -62,66 +62,18 @@ except Exception as e:
     SessionLocal = None
 
 # ============================================================================
-# LAZY LOADING STATE (ML models load only on first use)
 # ============================================================================
-class AppState:
-    """Global state for lazy-loaded ML components."""
-    def __init__(self):
-        self.detector = None  # YOLO model (loaded on first use)
-        self.torch_device = None  # CPU or CUDA (loaded on first use)
-        self.is_detector_loaded = False
-        self.confidence_threshold = 0.5
+# MODEL LOADING - Now handled by src/detection/model_loader.py
+# Using singleton pattern - model loads ONCE on first use
+# ============================================================================
+from src.detection.model_loader import get_model, get_detector_system
 
-state = AppState()
+# Simple state tracker for health checks
+class SimpleState:
+    model_loaded = False
+    confidence_threshold = 0.5
 
-
-def get_torch_device():
-    """
-    Lazy-load torch and determine device (CPU only on Railway).
-    Called only when ML inference is needed.
-    """
-    if state.torch_device is not None:
-        return state.torch_device
-
-    try:
-        import torch
-        # Railway has NO GPU, so always use CPU
-        state.torch_device = "cpu"
-        logger.info(f"🔧 PyTorch device initialized: {state.torch_device}")
-        return state.torch_device
-    except ImportError:
-        logger.error("❌ PyTorch not available")
-        return None
-
-
-def load_detector():
-    """
-    Lazy-load YOLO model on first use (singleton pattern).
-    This is expensive, so it only runs when needed.
-    """
-    if state.is_detector_loaded:
-        return state.detector
-
-    logger.info("⏳ Loading YOLO model (this may take 10-30 seconds)...")
-    
-    try:
-        # CRITICAL: Only import heavy ML modules when actually needed
-        from src.detection.fire_detector import FireDetectionSystem
-        
-        # Initialize torch device first
-        _ = get_torch_device()
-        
-        # Load the detector
-        state.detector = FireDetectionSystem()
-        state.is_detector_loaded = True
-        logger.info("✅ YOLO model loaded successfully!")
-        return state.detector
-        
-    except Exception as e:
-        logger.error(f"❌ Failed to load YOLO model: {e}")
-        state.detector = None
-        state.is_detector_loaded = False
-        return None
+state = SimpleState()
 
 
 # ============================================================================
@@ -154,7 +106,7 @@ async def health_check() -> HealthResponse:
     """
     return HealthResponse(
         status="ok",
-        model_loaded=state.is_detector_loaded,
+        model_loaded=state.model_loaded,
         timestamp=datetime.now().isoformat()
     )
 
@@ -192,10 +144,12 @@ def save_detection_to_db(
 def process_inference(image_np, threshold: float = 0.5) -> DetectionResult:
     """
     Run fire detection inference on image.
-    Lazy-loads YOLO model on first call.
+    Uses singleton YOLO model from model_loader.
     """
-    detector = load_detector()
-    if not detector:
+    model = get_model()
+    state.model_loaded = True  # Mark model as loaded after first successful call
+    
+    if not model:
         raise HTTPException(status_code=503, detail="Model not initialized")
 
     try:
@@ -205,12 +159,24 @@ def process_inference(image_np, threshold: float = 0.5) -> DetectionResult:
         # Convert RGB to BGR for OpenCV/YOLO
         image_bgr = image_np[:, :, ::-1]
         
-        # Run prediction
-        results = detector.predict(image_bgr, conf=threshold)
+        # Run YOLO prediction directly
+        yolo_results = model.predict(image_bgr, conf=threshold, verbose=False)
         
-        fire_detected = results.get('fire_detected', False)
-        confidence = results.get('confidence', 0.0)
-        yolo_boxes = results.get('yolo_boxes', [])
+        if not yolo_results or len(yolo_results) == 0:
+            return DetectionResult(
+                fire_detected=False,
+                confidence=0.0,
+                fire_type=None,
+                detections=[],
+                timestamp=datetime.now().isoformat(),
+                model_type="yolo",
+                threshold_used=threshold
+            )
+        
+        result = yolo_results[0]
+        fire_detected = result.boxes is not None and len(result.boxes) > 0
+        confidence = 0.0
+        yolo_boxes = result.boxes if fire_detected else []
         
         detections_list = []
         if yolo_boxes:
@@ -219,6 +185,7 @@ def process_inference(image_np, threshold: float = 0.5) -> DetectionResult:
                 try:
                     xyxy = box.xyxy[0].cpu().numpy().astype(int)
                     conf = float(box.conf[0])
+                    confidence = max(confidence, conf)
                     
                     # Normalize bbox for frontend
                     norm_bbox = [
@@ -401,7 +368,7 @@ async def set_detection_threshold(data: Dict):
 @app.get("/notification-status")
 async def get_notification_status():
     """Get notification system status."""
-    detector = load_detector()
+    detector = get_detector_system()
     
     if not detector or not hasattr(detector, 'notifier') or not detector.notifier:
         return {
@@ -423,7 +390,7 @@ async def get_notification_status():
 @app.post("/test-notification")
 async def test_notification():
     """Send test notification."""
-    detector = load_detector()
+    detector = get_detector_system()
     
     if not detector or not hasattr(detector, 'notifier') or not detector.notifier:
         raise HTTPException(status_code=503, detail="Notification system not available")
@@ -479,8 +446,8 @@ async def client_stream_detection(websocket: WebSocket):
                 
                 # Lazy-load detector on first frame
                 if detector is None:
-                    logger.info("⏳ Loading detector for client stream...")
-                    detector = load_detector()
+                    logger.info("⏳ Loading model for client stream...")
+                    detector = get_model()
                     if not detector:
                         await websocket.send_text(json.dumps({
                             "error": "Model failed to load"
@@ -508,26 +475,27 @@ async def client_stream_detection(websocket: WebSocket):
                     confidence = 0.0
                     detection_boxes = []
                     
-                    results = detector.predict(frame, conf=0.5)
-                    fire_detected = results.get('fire_detected', False)
-                    confidence = results.get('confidence', 0.0)
-                    yolo_boxes = results.get('yolo_boxes', [])
+                    yolo_results = detector.predict(frame, conf=0.5, verbose=False)
                     
-                    if yolo_boxes:
-                        h, w = frame.shape[:2]
-                        for box in yolo_boxes:
-                            try:
-                                xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                                conf_val = float(box.conf[0])
-                                detection_boxes.append({
-                                    'xyxy': [
-                                        int(xyxy[0]), int(xyxy[1]),
-                                        int(xyxy[2]), int(xyxy[3])
-                                    ],
-                                    'confidence': conf_val
-                                })
-                            except Exception as e:
-                                logger.debug(f"Box extraction error: {e}")
+                    if yolo_results and len(yolo_results) > 0:
+                        result = yolo_results[0]
+                        if result.boxes is not None and len(result.boxes) > 0:
+                            fire_detected = True
+                            h, w = frame.shape[:2]
+                            for box in result.boxes:
+                                try:
+                                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                                    conf_val = float(box.conf[0])
+                                    confidence = max(confidence, conf_val)
+                                    detection_boxes.append({
+                                        'xyxy': [
+                                            int(xyxy[0]), int(xyxy[1]),
+                                            int(xyxy[2]), int(xyxy[3])
+                                        ],
+                                        'confidence': conf_val
+                                    })
+                                except Exception as e:
+                                    logger.debug(f"Box extraction error: {e}")
                     
                     # Save to database (rate-limited)
                     if fire_detected and frame_count % 5 == 0:
@@ -673,41 +641,37 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
                 
                 # Lazy-load detector on first frame
                 if detector is None:
-                    logger.info("⏳ Loading detector for server stream...")
-                    detector = load_detector()
+                    logger.info("⏳ Loading model for server stream...")
+                    detector = get_model()
                     if not detector:
-                        logger.error("❌ Failed to load detector")
+                        logger.error("❌ Failed to load model")
                         break
                 
                 # Run inference
-                results = detector.predict(frame, conf=0.5)
-                fire_detected = results.get('fire_detected', False)
-                confidence = results.get('confidence', 0.0)
-                yolo_boxes = results.get('yolo_boxes', [])
+                yolo_results = detector.predict(frame, conf=0.5, verbose=False)
                 
-                # Extract boxes for response
-                if yolo_boxes:
-                    h, w = frame.shape[:2]
-                    for box in yolo_boxes:
-                        try:
-                            xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                            conf_val = float(box.conf[0])
-                            detection_boxes.append({
-                                'xyxy': [
-                                    int(xyxy[0]), int(xyxy[1]),
-                                    int(xyxy[2]), int(xyxy[3])
-                                ],
-                                'confidence': conf_val
-                            })
-                        except Exception as e:
-                            logger.debug(f"Box extraction error: {e}")
+                if yolo_results and len(yolo_results) > 0:
+                    result = yolo_results[0]
+                    if result.boxes is not None and len(result.boxes) > 0:
+                        fire_detected = True
+                        for box in result.boxes:
+                            try:
+                                xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                                conf = float(box.conf[0])
+                                confidence = max(confidence, conf)
+                                detection_boxes.append({
+                                    'xyxy': [int(x) for x in xyxy],
+                                    'confidence': conf
+                                })
+                            except Exception as e:
+                                logger.error(f"Error processing box: {e}")
                 
                 # Draw annotations on frame
                 color = (0, 0, 255) if fire_detected else (0, 255, 0)
-                if yolo_boxes:
-                    for box in yolo_boxes:
-                        xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                        conf_val = float(box.conf[0])
+                if detection_boxes:
+                    for box_info in detection_boxes:
+                        xyxy = box_info['xyxy']
+                        conf_val = box_info['confidence']
                         cv2.rectangle(
                             frame,
                             (xyxy[0], xyxy[1]),
