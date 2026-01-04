@@ -1,6 +1,9 @@
 """
-Fire Detection API
+Fire Detection API - Railway-Compatible
 FastAPI backend using YOLO-Only model for fire detection
+- Fast startup: NO ML models loaded at import time
+- Lazy loading: Models load only on first API/WebSocket call
+- CPU-only: Defaults to CPU, no CUDA requirement
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, WebSocket, WebSocketDisconnect
@@ -8,35 +11,30 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 from datetime import datetime
-import numpy as np
-from io import BytesIO
-from PIL import Image
-import asyncio
-import base64
-import torch
 import logging
 import sys
 from pathlib import Path
+import json
+from io import BytesIO
+import base64
+import asyncio
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent.parent))
 
-from src.detection.fire_detector import FireDetectionSystem
-from src.utils.database import init_db, DetectionEvent, SystemConfig, SessionLocal
-import json
-
-# Setup logging
-logging.basicConfig(level=logging.INFO)
+# Setup logging FIRST, before any other imports
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
-# Initialize DB
-logger.info("Connecting to Database...")
-SessionLocal = init_db()
-
-# Initialize FastAPI app
+# ============================================================================
+# FAST STARTUP: Initialize FastAPI app immediately (NO heavy ML imports yet)
+# ============================================================================
 app = FastAPI(
     title="Fire Detection API",
-    description="YOLO-Only Fire Detection System",
+    description="YOLO-Only Fire Detection System (Railway-Compatible)",
     version="3.0.0"
 )
 
@@ -49,60 +47,131 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==== Pydantic Models ====
+logger.info("✅ FastAPI app initialized (ready to bind to $PORT)")
 
+# ============================================================================
+# DATABASE INITIALIZATION (lightweight, happens at import time)
+# ============================================================================
+try:
+    from src.utils.database import init_db, DetectionEvent, SystemConfig, SessionLocal
+    logger.info("✅ Database module imported")
+    SessionLocal = init_db()
+    logger.info("✅ Database initialized")
+except Exception as e:
+    logger.error(f"⚠️  Database initialization failed: {e}")
+    SessionLocal = None
+
+# ============================================================================
+# LAZY LOADING STATE (ML models load only on first use)
+# ============================================================================
+class AppState:
+    """Global state for lazy-loaded ML components."""
+    def __init__(self):
+        self.detector = None  # YOLO model (loaded on first use)
+        self.torch_device = None  # CPU or CUDA (loaded on first use)
+        self.is_detector_loaded = False
+        self.confidence_threshold = 0.5
+
+state = AppState()
+
+
+def get_torch_device():
+    """
+    Lazy-load torch and determine device (CPU only on Railway).
+    Called only when ML inference is needed.
+    """
+    if state.torch_device is not None:
+        return state.torch_device
+
+    try:
+        import torch
+        # Railway has NO GPU, so always use CPU
+        state.torch_device = "cpu"
+        logger.info(f"🔧 PyTorch device initialized: {state.torch_device}")
+        return state.torch_device
+    except ImportError:
+        logger.error("❌ PyTorch not available")
+        return None
+
+
+def load_detector():
+    """
+    Lazy-load YOLO model on first use (singleton pattern).
+    This is expensive, so it only runs when needed.
+    """
+    if state.is_detector_loaded:
+        return state.detector
+
+    logger.info("⏳ Loading YOLO model (this may take 10-30 seconds)...")
+    
+    try:
+        # CRITICAL: Only import heavy ML modules when actually needed
+        from src.detection.fire_detector import FireDetectionSystem
+        
+        # Initialize torch device first
+        _ = get_torch_device()
+        
+        # Load the detector
+        state.detector = FireDetectionSystem()
+        state.is_detector_loaded = True
+        logger.info("✅ YOLO model loaded successfully!")
+        return state.detector
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to load YOLO model: {e}")
+        state.detector = None
+        state.is_detector_loaded = False
+        return None
+
+
+# ============================================================================
+# PYDANTIC MODELS
+# ============================================================================
 class DetectionResult(BaseModel):
     fire_detected: bool
     confidence: float
     fire_type: Optional[str] = None
-    fire_type_probs: Optional[Dict[str, float]] = None
     detections: List[Dict] = []
     timestamp: str
     model_type: str = "yolo"
     threshold_used: float = 0.5
-    fusion_weights: Optional[Dict[str, float]] = None # Deprecated/Empty
+
 
 class HealthResponse(BaseModel):
     status: str
     model_loaded: bool
-    model_type: str
-    device: str
     timestamp: str
 
-# ==== State Management ====
-class AppState:
-    def __init__(self):
-        self.detector = None
-        self.is_loaded = False
-        self.device = "cpu"
-        self.confidence_threshold = 0.5  # Default threshold for fire detection (50% minimum)
 
-state = AppState()
+# ============================================================================
+# LIGHTWEIGHT HEALTH CHECK (fast startup, no ML)
+# ============================================================================
+@app.get("/health")
+async def health_check() -> HealthResponse:
+    """
+    Lightweight health check - returns immediately.
+    Does NOT load ML models.
+    """
+    return HealthResponse(
+        status="ok",
+        model_loaded=state.is_detector_loaded,
+        timestamp=datetime.now().isoformat()
+    )
 
-# ==== Startup Event ====
-@app.on_event("startup")
-async def startup_event():
-    logger.info("Starting Fire Detection API...")
-    try:
-        state.device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"Using device: {state.device}")
-        
-        # Initialize the refactored YOLO-only system
-        # It handles its own config loading and model initialization
-        state.detector = FireDetectionSystem()
-        state.is_loaded = True
-        logger.info("✅ YOLO-Only FireDetectionSystem loaded successfully!")
-        
-    except Exception as e:
-        logger.error(f"❌ Startup Error: {e}")
-        state.is_loaded = False
 
-# ==== Helper Functions ====
-def save_detection_to_db(fire_detected: bool, confidence: float, location: str = "Unknown", detections_list: List[Dict] = None):
-    """Save detection event to database."""
+# ============================================================================
+# DETECTION HELPER FUNCTIONS
+# ============================================================================
+def save_detection_to_db(
+    fire_detected: bool,
+    confidence: float,
+    location: str = "Unknown",
+    detections_list: List[Dict] = None
+):
+    """Save detection event to database with error handling."""
     if not fire_detected or not SessionLocal:
         return
-    
+
     try:
         db = SessionLocal()
         event = DetectionEvent(
@@ -115,148 +184,171 @@ def save_detection_to_db(fire_detected: bool, confidence: float, location: str =
         db.add(event)
         db.commit()
         db.close()
-        logger.debug(f"Saved detection to DB: confidence={confidence:.2%}, location={location}")
+        logger.debug(f"💾 Saved detection to DB: confidence={confidence:.2%}, location={location}")
     except Exception as e:
-        logger.error(f"Failed to save to DB: {e}")
+        logger.error(f"❌ Failed to save to DB: {e}")
 
-def process_inference(image_np: np.ndarray, threshold: float = 0.5) -> DetectionResult:
-    """Run inference using the loaded detector."""
-    if not state.detector:
-         raise HTTPException(status_code=503, detail="Model not initialized")
-         
-    # Run prediction
-    # Run prediction
-    # detector.predict() expects file path, numpy array, or tensor
-    # IMPORTANT: Ultralytics assumes BGR for numpy arrays, but we have RGB from PIL.
-    # We must convert to BGR.
-    image_bgr = image_np[:, :, ::-1] # Flip channels RGB -> BGR
-    results = state.detector.predict(image_bgr, conf=threshold)
-    
-    # Extract data from standardized result dict
-    fire_detected = results['fire_detected']
-    confidence = results['confidence']
-    yolo_boxes = results.get('yolo_boxes')
-    
-    detections_list = []
-    if yolo_boxes is not None:
-         for box in yolo_boxes:
-             # Basic info for frontend
-             xyxy = box.xyxy[0].cpu().tolist()
-             conf = float(box.conf[0])
-             cls_id = int(box.cls[0])
-             
-             # Normalize bbox for frontend [x, y, w, h] normalized
-             h, w, _ = image_np.shape
-             norm_bbox = [
-                 xyxy[0] / w,
-                 xyxy[1] / h,
-                 (xyxy[2] - xyxy[0]) / w,
-                 (xyxy[3] - xyxy[1]) / h
-             ]
-             
-             detections_list.append({
-                 'class': 'fire', # Simplified
-                 'confidence': conf,
-                 'bbox': norm_bbox,
-                 'bbox_xyxy': xyxy
-             })
-    
-    
-    # Save to Database if Fire Detected
-    if fire_detected:
-        save_detection_to_db(fire_detected, confidence, "Camera 1 (Upload)", detections_list)
 
-    return DetectionResult(
-        fire_detected=fire_detected,
-        confidence=confidence,
-        fire_type="Wildfire / Hazard" if fire_detected else None,
-        # Legacy/Compatibility fields
-        fire_type_probs={'Class A': 1.0} if fire_detected else None, 
-        detections=detections_list,
-        timestamp=datetime.now().isoformat(),
-        model_type="yolo",
-        threshold_used=threshold,
-        fusion_weights=None
-    )
+def process_inference(image_np, threshold: float = 0.5) -> DetectionResult:
+    """
+    Run fire detection inference on image.
+    Lazy-loads YOLO model on first call.
+    """
+    detector = load_detector()
+    if not detector:
+        raise HTTPException(status_code=503, detail="Model not initialized")
 
-# ==== API Endpoints ====
+    try:
+        # Import numpy and PIL only when needed
+        import numpy as np
+        
+        # Convert RGB to BGR for OpenCV/YOLO
+        image_bgr = image_np[:, :, ::-1]
+        
+        # Run prediction
+        results = detector.predict(image_bgr, conf=threshold)
+        
+        fire_detected = results.get('fire_detected', False)
+        confidence = results.get('confidence', 0.0)
+        yolo_boxes = results.get('yolo_boxes', [])
+        
+        detections_list = []
+        if yolo_boxes:
+            h, w = image_np.shape[:2]
+            for box in yolo_boxes:
+                try:
+                    xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                    conf = float(box.conf[0])
+                    
+                    # Normalize bbox for frontend
+                    norm_bbox = [
+                        float(xyxy[0]) / w,
+                        float(xyxy[1]) / h,
+                        float(xyxy[2] - xyxy[0]) / w,
+                        float(xyxy[3] - xyxy[1]) / h
+                    ]
+                    
+                    detections_list.append({
+                        'class': 'fire',
+                        'confidence': conf,
+                        'bbox': norm_bbox,
+                        'bbox_xyxy': [int(x) for x in xyxy]
+                    })
+                except Exception as e:
+                    logger.error(f"❌ Error processing box: {e}")
+                    continue
+        
+        # Save to database if fire detected
+        if fire_detected:
+            save_detection_to_db(fire_detected, confidence, "Upload", detections_list)
+        
+        return DetectionResult(
+            fire_detected=fire_detected,
+            confidence=float(confidence),
+            fire_type="Fire" if fire_detected else None,
+            detections=detections_list,
+            timestamp=datetime.now().isoformat(),
+            model_type="yolo",
+            threshold_used=threshold
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ Inference error: {e}")
+        raise HTTPException(status_code=500, detail=f"Inference failed: {str(e)}")
 
-@app.get("/health", response_model=HealthResponse)
-async def health_check():
-    return HealthResponse(
-        status="healthy" if state.is_loaded else "error",
-        model_loaded=state.is_loaded,
-        model_type="yolo-only",
-        device=state.device,
-        timestamp=datetime.now().isoformat()
-    )
 
+# ============================================================================
+# REST API ENDPOINTS
+# ============================================================================
 @app.post("/detect", response_model=DetectionResult)
 async def detect_fire(
     file: UploadFile = File(...),
-    threshold: float = 0.5  # Confidence threshold for fire detection (50% minimum)
+    threshold: float = 0.5
 ):
-    if not state.is_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded")
+    """
+    Upload image for fire detection.
+    Lazy-loads model on first call.
+    """
+    try:
+        from PIL import Image
+        import numpy as np
         
-    contents = await file.read()
-    image = Image.open(BytesIO(contents)).convert('RGB')
-    image_np = np.array(image)
-    
-    # Simulate processing time slightly if needed for UI smoothness, or remove
-    # await asyncio.sleep(0.5) 
-    
-    return process_inference(image_np, threshold)
+        contents = await file.read()
+        image = Image.open(BytesIO(contents)).convert('RGB')
+        image_np = np.array(image)
+        
+        return process_inference(image_np, threshold)
+        
+    except Exception as e:
+        logger.error(f"❌ Upload detection failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.post("/detect/base64", response_model=DetectionResult)
 async def detect_fire_base64(data: Dict):
-    if not state.is_loaded:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-        
-    image_data = data.get('image', '')
-    threshold = float(data.get('threshold', 0.5))
-    
-    if ',' in image_data:
-        image_data = image_data.split(',')[1]
-        
+    """Upload base64-encoded image for fire detection."""
     try:
+        from PIL import Image
+        import numpy as np
+        
+        image_data = data.get('image', '')
+        threshold = float(data.get('threshold', 0.5))
+        
+        if ',' in image_data:
+            image_data = image_data.split(',')[1]
+        
         image_bytes = base64.b64decode(image_data)
         image = Image.open(BytesIO(image_bytes)).convert('RGB')
         image_np = np.array(image)
         
         return process_inference(image_np, threshold)
+        
     except Exception as e:
-        logger.error(f"Base64 error: {e}")
+        logger.error(f"❌ Base64 detection failed: {e}")
         raise HTTPException(status_code=400, detail="Invalid image data")
+
 
 @app.post("/test/thresholds")
 async def test_thresholds(file: UploadFile = File(...)):
-    """Test with multiple thresholds."""
-    contents = await file.read()
-    image = Image.open(BytesIO(contents)).convert('RGB')
-    image_np = np.array(image)
-    
-    thresholds = [0.3, 0.5, 0.7, 0.9]
-    results = {}
-    
-    for thresh in thresholds:
-        res = process_inference(image_np, threshold=thresh)
-        results[f"threshold_{thresh}"] = {
-            "fire_detected": res.fire_detected,
-            "status": "🔥 FIRE" if res.fire_detected else "✅ SAFE"
-        }
+    """Test detection with multiple confidence thresholds."""
+    try:
+        from PIL import Image
+        import numpy as np
         
-    return {"results": results}
+        contents = await file.read()
+        image = Image.open(BytesIO(contents)).convert('RGB')
+        image_np = np.array(image)
+        
+        thresholds = [0.3, 0.5, 0.7, 0.9]
+        results = {}
+        
+        for thresh in thresholds:
+            res = process_inference(image_np, threshold=thresh)
+            results[f"threshold_{thresh}"] = {
+                "fire_detected": res.fire_detected,
+                "confidence": res.confidence,
+                "status": "🔥 FIRE" if res.fire_detected else "✅ SAFE"
+            }
+        
+        return {"results": results}
+        
+    except Exception as e:
+        logger.error(f"❌ Threshold test failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.get("/alerts")
 async def get_alerts():
-    """Get detection history."""
+    """Get detection history from database."""
     if not SessionLocal:
         return {"alerts": []}
     
     db = SessionLocal()
     try:
-        events = db.query(DetectionEvent).order_by(DetectionEvent.timestamp.desc()).limit(50).all()
+        events = db.query(DetectionEvent).order_by(
+            DetectionEvent.timestamp.desc()
+        ).limit(50).all()
+        
         alerts = []
         for e in events:
             alerts.append({
@@ -264,181 +356,187 @@ async def get_alerts():
                 "timestamp": e.timestamp.isoformat(),
                 "confidence": e.confidence,
                 "location": e.location,
-                "status": "active" # placeholder
+                "status": "active"
             })
         return {"alerts": alerts}
-    finally:
-        db.close()
-
-class ConfigUpdate(BaseModel):
-    key: str
-    value: str
-
-@app.post("/config")
-async def update_config(config: ConfigUpdate):
-    """Update system configuration (e.g. camera IP)."""
-    if not SessionLocal:
-         raise HTTPException(status_code=503, detail="Database not available")
-    
-    db = SessionLocal()
-    try:
-        # Check if exists
-        item = db.query(SystemConfig).filter(SystemConfig.key == config.key).first()
-        if item:
-            item.value = config.value
-        else:
-            item = SystemConfig(key=config.key, value=config.value)
-            db.add(item)
-        db.commit()
-        return {"status": "success", "key": config.key, "value": config.value}
+        
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"❌ Failed to fetch alerts: {e}")
+        return {"alerts": []}
     finally:
         db.close()
 
-@app.get("/config/{key}")
-async def get_config_item(key: str):
-    if not SessionLocal:
-        return {"value": None}
-    db = SessionLocal()
-    try:
-        item = db.query(SystemConfig).filter(SystemConfig.key == key).first()
-        return {"value": item.value if item else None}
-    finally:
-        db.close()
 
 @app.get("/detection-threshold")
 async def get_detection_threshold():
     """Get current fire detection confidence threshold."""
     return {
         "threshold": state.confidence_threshold,
-        "description": "Minimum confidence score (0.0-1.0) for fire detection. Higher = fewer false positives, lower = more sensitive"
+        "description": "Minimum confidence (0.0-1.0) for fire detection"
     }
+
 
 @app.post("/detection-threshold")
 async def set_detection_threshold(data: Dict):
     """Set fire detection confidence threshold."""
-    threshold = float(data.get('threshold', 0.5))
-    
-    # Validate range
-    if threshold < 0.0 or threshold > 1.0:
-        raise HTTPException(status_code=400, detail="Threshold must be between 0.0 and 1.0")
-    
-    state.confidence_threshold = threshold
-    logger.info(f"Detection threshold updated to {threshold}")
-    
-    return {
-        "status": "success",
-        "threshold": state.confidence_threshold,
-        "message": f"Fire detection threshold set to {threshold:.0%}"
-    }
+    try:
+        threshold = float(data.get('threshold', 0.5))
+        
+        if threshold < 0.0 or threshold > 1.0:
+            raise HTTPException(status_code=400, detail="Threshold must be 0.0-1.0")
+        
+        state.confidence_threshold = threshold
+        logger.info(f"🔧 Detection threshold updated to {threshold}")
+        
+        return {
+            "status": "success",
+            "threshold": state.confidence_threshold
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ Threshold update failed: {e}")
+        raise HTTPException(status_code=400, detail=str(e))
+
 
 @app.get("/notification-status")
 async def get_notification_status():
-    """Get status of notification system (email and SMS)."""
-    if not state.detector or not state.detector.notifier:
+    """Get notification system status."""
+    detector = load_detector()
+    
+    if not detector or not hasattr(detector, 'notifier') or not detector.notifier:
         return {
-            "status": "not_initialized",
-            "message": "Notification system not initialized"
+            "status": "not_configured",
+            "message": "Notification system not available"
         }
     
-    status = state.detector.notifier.get_status()
-    return {
-        "status": "ok",
-        "notifications": status,
-        "message": "Notification system status retrieved"
-    }
+    try:
+        status = detector.notifier.get_status()
+        return {
+            "status": "ok",
+            "notifications": status
+        }
+    except Exception as e:
+        logger.error(f"❌ Notification status failed: {e}")
+        return {"status": "error", "message": str(e)}
+
 
 @app.post("/test-notification")
 async def test_notification():
-    """Send a test notification to configured email and SMS."""
-    if not state.detector or not state.detector.notifier:
-        raise HTTPException(status_code=503, detail="Notification system not initialized")
+    """Send test notification."""
+    detector = load_detector()
+    
+    if not detector or not hasattr(detector, 'notifier') or not detector.notifier:
+        raise HTTPException(status_code=503, detail="Notification system not available")
     
     try:
-        # Send test email and SMS
-        state.detector.notifier.send_fire_alert(
+        detector.notifier.send_fire_alert(
             confidence=0.95,
             location="TEST - Fire Detection System",
             image_path=None
         )
         
-        status = state.detector.notifier.get_status()
+        status = detector.notifier.get_status()
         return {
             "status": "success",
             "message": "Test notification sent",
             "details": {
-                "email_sent": status["email_configured"],
-                "sms_sent": status["sms_configured"],
-                "email_recipients": status["email_recipients"],
-                "sms_recipients": status["sms_recipients"]
+                "email_configured": status.get("email_configured", False),
+                "sms_configured": status.get("sms_configured", False)
             }
         }
     except Exception as e:
-        logger.error(f"Test notification failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to send test notification: {str(e)}")
+        logger.error(f"❌ Test notification failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
+
+# ============================================================================
+# WEBSOCKET ENDPOINTS - LAZY LOADING SAFE
+# ============================================================================
 @app.websocket("/ws/video")
 async def client_stream_detection(websocket: WebSocket):
     """
-    Client-side streaming endpoint (Laptop Mode).
-    Receives base64 frames from client -> Runs Inference -> Returns detections.
+    Client-side WebSocket (Laptop Camera Mode).
+    Receives base64 frames → Runs inference → Returns detections.
+    
+    Model is lazy-loaded on first frame.
     """
     await websocket.accept()
-    import cv2
     
     frame_count = 0
     is_connected = True
+    detector = None
+    
+    logger.info("📡 Client WebSocket connected")
     
     try:
         while is_connected:
             try:
-                # Receive base64 image from client
+                # Receive base64 frame from client
                 data = await websocket.receive_text()
                 
-                # Decode
-                if "base64," in data:
-                    data = data.split("base64,")[1]
-                
-                # Decode from base64
-                img_bytes = base64.b64decode(data)
-                img_arr = np.frombuffer(img_bytes, np.uint8)
-                frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
-                
-                if frame is None:
-                    logger.debug("Failed to decode frame")
+                if not data:
                     continue
                 
-                # Inference with fire detection
-                fire_detected = False
-                confidence = 0.0
-                detection_boxes = []
+                # Lazy-load detector on first frame
+                if detector is None:
+                    logger.info("⏳ Loading detector for client stream...")
+                    detector = load_detector()
+                    if not detector:
+                        await websocket.send_text(json.dumps({
+                            "error": "Model failed to load"
+                        }))
+                        break
                 
-                # Using 0.5 confidence threshold to reduce false positives from sunlight
-                if state.detector:
-                    try:
-                        results = state.detector.predict(frame, conf=0.5)
-                        fire_detected = results.get('fire_detected', False)
-                        confidence = results.get('confidence', 0.0)
-                        yolo_boxes = results.get('yolo_boxes', [])
-                        
-                        # Extract box coordinates for response
-                        if yolo_boxes:
-                            h, w = frame.shape[:2]
-                            for box in yolo_boxes:
+                try:
+                    # Decode base64 frame
+                    import cv2
+                    import numpy as np
+                    
+                    if "base64," in data:
+                        data = data.split("base64,")[1]
+                    
+                    img_bytes = base64.b64decode(data)
+                    img_arr = np.frombuffer(img_bytes, np.uint8)
+                    frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+                    
+                    if frame is None:
+                        logger.debug("⚠️  Failed to decode frame")
+                        continue
+                    
+                    # Run inference
+                    fire_detected = False
+                    confidence = 0.0
+                    detection_boxes = []
+                    
+                    results = detector.predict(frame, conf=0.5)
+                    fire_detected = results.get('fire_detected', False)
+                    confidence = results.get('confidence', 0.0)
+                    yolo_boxes = results.get('yolo_boxes', [])
+                    
+                    if yolo_boxes:
+                        h, w = frame.shape[:2]
+                        for box in yolo_boxes:
+                            try:
                                 xyxy = box.xyxy[0].cpu().numpy().astype(int)
                                 conf_val = float(box.conf[0])
                                 detection_boxes.append({
-                                    'xyxy': [int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])],
+                                    'xyxy': [
+                                        int(xyxy[0]), int(xyxy[1]),
+                                        int(xyxy[2]), int(xyxy[3])
+                                    ],
                                     'confidence': conf_val
                                 })
-                    except Exception as inference_err:
-                        logger.error(f"Inference error: {inference_err}")
-                        continue
-                
-                # Return complete detection results (Frontend draws boxes for Laptop mode)
-                try:
+                            except Exception as e:
+                                logger.debug(f"Box extraction error: {e}")
+                    
+                    # Save to database (rate-limited)
+                    if fire_detected and frame_count % 5 == 0:
+                        save_detection_to_db(
+                            fire_detected, confidence,
+                            "Laptop Camera", detection_boxes
+                        )
+                    
+                    # Send response
                     response = {
                         "fire_detected": fire_detected,
                         "confidence": float(confidence),
@@ -448,201 +546,231 @@ async def client_stream_detection(websocket: WebSocket):
                         "frame_id": frame_count
                     }
                     
-                    # Save to database if fire detected (with rate limiting - every 5 frames)
-                    if fire_detected and frame_count % 5 == 0:  # ~5 FPS client send rate, so every 5 frames = ~1 second
-                        save_detection_to_db(fire_detected, confidence, "Laptop Camera", detection_boxes)
-                    
                     await websocket.send_text(json.dumps(response))
                     frame_count += 1
-                except Exception as send_err:
-                    logger.error(f"Failed to send response: {send_err}")
-                    is_connected = False
-                    break
+                    
+                except json.JSONDecodeError:
+                    logger.debug("⚠️  Invalid JSON in frame data")
+                    continue
+                except Exception as inference_err:
+                    logger.error(f"❌ Inference error: {inference_err}")
+                    continue
                     
             except WebSocketDisconnect:
-                logger.info("Client detection disconnected (receive loop)")
+                logger.info("📡 Client WebSocket disconnected")
                 is_connected = False
                 break
-            except RuntimeError as rt_err:
-                # Catch "Cannot call receive once a disconnect message has been received"
-                if "disconnect" in str(rt_err).lower():
-                    logger.info("WebSocket already disconnected")
+            except RuntimeError as e:
+                if "disconnect" in str(e).lower():
+                    logger.info("📡 Client WebSocket runtime disconnect")
                     is_connected = False
                     break
-                else:
-                    logger.error(f"Runtime error: {rt_err}")
-                    is_connected = False
-                    break
+                logger.error(f"❌ Runtime error: {e}")
+                is_connected = False
+                break
             except Exception as e:
-                logger.error(f"Frame processing error: {e}")
-                # Only continue if it's not a disconnect error
+                logger.error(f"❌ Client frame error: {e}")
                 if "disconnect" in str(e).lower():
                     is_connected = False
                     break
-                # For other errors, skip frame and continue
                 
     except WebSocketDisconnect:
-        logger.info("Client detection disconnected (outer)")
+        logger.info("📡 Client WebSocket closed (outer)")
     except Exception as e:
-        logger.error(f"Client socket error: {e}")
+        logger.error(f"❌ Client socket error: {e}")
     finally:
-        logger.info("Client detection WebSocket closed")
+        logger.info("📡 Client WebSocket cleanup complete")
 
 
 @app.websocket("/ws/stream/{source_type}")
 async def server_stream_feed(websocket: WebSocket, source_type: str):
     """
-    Server-side streaming endpoint (IP/USB/RTSP Mode).
-    Opens camera on server -> Runs Inference -> Sends annotated frames to client.
-    Query Parameters:
-    - url: Camera URL (for IP/RTSP sources)
-    - device: Device index (for USB sources)
+    Server-side WebSocket (IP/USB/RTSP Camera Mode).
+    Opens camera on server → Runs inference → Sends annotated frames.
+    
+    Model is lazy-loaded on first frame.
     """
     await websocket.accept()
     
-    # Get query parameters
+    # Get camera source from query params
     url_param = websocket.query_params.get('url')
     device_param = websocket.query_params.get('device')
     
-    logger.info(f"Stream connection: type={source_type}, url={url_param}, device={device_param}")
+    logger.info(f"📡 Server stream connected: type={source_type}, url={url_param}")
     
-    # HANDSHAKE: Frontend needs this to know stream is ready and set isStreaming=true
+    # Send handshake
     await websocket.send_text(json.dumps({
         "type": "status",
         "status": "connected",
         "message": f"Connected to {source_type} stream"
     }))
     
-    # Determine Source
+    # Determine camera source
     camera_source = None
-    
     if source_type == 'usb':
-        # Use device parameter if provided, otherwise default to 0
         camera_source = int(device_param) if device_param else 0
-        logger.info(f"Opening USB camera at index: {camera_source}")
     elif source_type == 'ip':
-        # Use URL parameter for IP camera
         if url_param:
             camera_source = url_param
-            logger.info(f"Opening IP camera at URL: {camera_source}")
         else:
-            logger.error("IP camera URL not provided")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "error": "IP camera URL is required. Please provide a valid camera URL."
+                "error": "IP camera URL required"
             }))
             return
     elif source_type == 'rtsp':
-        # Use URL parameter for RTSP stream
         if url_param:
             camera_source = url_param
-            logger.info(f"Opening RTSP stream at: {camera_source}")
         else:
-            logger.error("RTSP stream URL not provided")
             await websocket.send_text(json.dumps({
                 "type": "error",
-                "error": "RTSP stream URL is required. Please provide a valid stream URL."
+                "error": "RTSP stream URL required"
             }))
             return
     else:
-        # Fallback
         camera_source = 0
-
+    
     import cv2
+    import numpy as np
+    
     camera = None
     frame_count = 0
+    detector = None
     
     try:
+        # Open camera
         if camera_source is not None:
             camera = cv2.VideoCapture(camera_source)
             
-            # Set timeout for connection attempts
             if isinstance(camera_source, str):
-                camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer for lower latency
+                camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             
             if not camera.isOpened():
-                 logger.error(f"Could not open source: {source_type} - {camera_source}")
-                 await websocket.send_text(json.dumps({
-                     "type": "error",
-                     "error": f"Failed to connect to {source_type} camera. Check URL and network connection.",
-                     "details": str(camera_source)
-                 }))
-                 # Use dummy loop to keep connection open so UI doesn't spasm
-                 while True:
-                     await asyncio.sleep(1)
-                 return
+                logger.error(f"❌ Could not open {source_type}: {camera_source}")
+                await websocket.send_text(json.dumps({
+                    "type": "error",
+                    "error": f"Failed to connect to {source_type} camera"
+                }))
+                # Keep connection open
+                while True:
+                    await asyncio.sleep(1)
+                return
             
-            logger.info(f"✅ Successfully opened {source_type} camera")
+            logger.info(f"✅ {source_type.upper()} camera opened")
         
+        # Stream loop
         while True:
             fire_detected = False
             confidence = 0.0
             detection_boxes = []
+            frame = None
             
             if camera and camera.isOpened():
                 success, frame = camera.read()
                 if not success:
+                    logger.warning(f"⚠️  Failed to read frame from {source_type}")
                     break
                 
-                # Run Inference - Fire detection on every frame
-                # Using 0.5 confidence threshold to reduce false positives from sunlight
-                if state.detector:
-                    results = state.detector.predict(frame, conf=0.5)
-                    fire_detected = results['fire_detected']
-                    confidence = results.get('confidence', 0.0)
-                    yolo_boxes = results.get('yolo_boxes', [])
-                    
-                    # Store box info for response
-                    if yolo_boxes:
-                        h, w = frame.shape[:2]
-                        for box in yolo_boxes:
+                # Lazy-load detector on first frame
+                if detector is None:
+                    logger.info("⏳ Loading detector for server stream...")
+                    detector = load_detector()
+                    if not detector:
+                        logger.error("❌ Failed to load detector")
+                        break
+                
+                # Run inference
+                results = detector.predict(frame, conf=0.5)
+                fire_detected = results.get('fire_detected', False)
+                confidence = results.get('confidence', 0.0)
+                yolo_boxes = results.get('yolo_boxes', [])
+                
+                # Extract boxes for response
+                if yolo_boxes:
+                    h, w = frame.shape[:2]
+                    for box in yolo_boxes:
+                        try:
                             xyxy = box.xyxy[0].cpu().numpy().astype(int)
                             conf_val = float(box.conf[0])
                             detection_boxes.append({
-                                'xyxy': [int(xyxy[0]), int(xyxy[1]), int(xyxy[2]), int(xyxy[3])],
+                                'xyxy': [
+                                    int(xyxy[0]), int(xyxy[1]),
+                                    int(xyxy[2]), int(xyxy[3])
+                                ],
                                 'confidence': conf_val
                             })
-                    
-                    # Draw annotations (Server side drawing)
-                    color = (0, 0, 255) if fire_detected else (0, 255, 0)
-                    if yolo_boxes:
-                        for box in yolo_boxes:
-                            xyxy = box.xyxy[0].cpu().numpy().astype(int)
-                            conf_val = float(box.conf[0])
-                            cv2.rectangle(frame, (xyxy[0], xyxy[1]), (xyxy[2], xyxy[3]), color, 2)
-                            label = f"FIRE {conf_val:.0%}"
-                            cv2.putText(frame, label, (xyxy[0], xyxy[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                    
-                    # Add detection status in corner
-                    status_text = "🔥 FIRE DETECTED" if fire_detected else "✅ Area Clear"
-                    status_color = (0, 0, 255) if fire_detected else (0, 255, 0)
-                    cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-                    cv2.putText(frame, f"Confidence: {confidence:.1%}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                    
-                    # Save to database if fire detected (with rate limiting - only every 5 seconds)
-                    if fire_detected and frame_count % 150 == 0:  # ~30 FPS, so 150 frames = 5 seconds
-                        save_detection_to_db(fire_detected, confidence, f"{source_type.upper()} Stream", detection_boxes)
+                        except Exception as e:
+                            logger.debug(f"Box extraction error: {e}")
                 
-                # Encode with optimized compression
-                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if not ret or buffer is None:
-                    logger.error("Failed to encode frame")
-                    continue
-                    
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                image_data = f"data:image/jpeg;base64,{frame_b64}"
+                # Draw annotations on frame
+                color = (0, 0, 255) if fire_detected else (0, 255, 0)
+                if yolo_boxes:
+                    for box in yolo_boxes:
+                        xyxy = box.xyxy[0].cpu().numpy().astype(int)
+                        conf_val = float(box.conf[0])
+                        cv2.rectangle(
+                            frame,
+                            (xyxy[0], xyxy[1]),
+                            (xyxy[2], xyxy[3]),
+                            color, 2
+                        )
+                        label = f"FIRE {conf_val:.0%}"
+                        cv2.putText(
+                            frame, label,
+                            (xyxy[0], xyxy[1] - 10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
+                        )
+                
+                # Status overlay
+                status_text = "🔥 FIRE DETECTED" if fire_detected else "✅ Area Clear"
+                status_color = (0, 0, 255) if fire_detected else (0, 255, 0)
+                cv2.putText(
+                    frame, status_text,
+                    (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2
+                )
+                cv2.putText(
+                    frame, f"Confidence: {confidence:.1%}",
+                    (10, 60),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
+                )
+                
+                # Save to database (rate-limited)
+                if fire_detected and frame_count % 150 == 0:
+                    save_detection_to_db(
+                        fire_detected, confidence,
+                        f"{source_type.upper()} Stream",
+                        detection_boxes
+                    )
                 
             else:
-                # No camera source (e.g. unconfigured IP) - Send Placeholder
-                blank = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(blank, f"NO SOURCE FOR {source_type.upper()}", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-                cv2.putText(blank, "Select a camera source from the UI", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
-                ret, buffer = cv2.imencode('.jpg', blank)
+                # No camera: send placeholder
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(
+                    frame, f"NO SOURCE FOR {source_type.upper()}",
+                    (50, 240),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
+                )
+                cv2.putText(
+                    frame, "Check camera configuration",
+                    (50, 300),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1
+                )
+                await asyncio.sleep(0.5)
+            
+            # Encode frame
+            if frame is not None:
+                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if not ret or buffer is None:
+                    logger.error("❌ Frame encoding failed")
+                    continue
+                
                 frame_b64 = base64.b64encode(buffer).decode('utf-8')
                 image_data = f"data:image/jpeg;base64,{frame_b64}"
-                await asyncio.sleep(0.5) # Slow blink
+            else:
+                continue
             
-            # Send to Client with complete detection data
+            # Send payload
             payload = {
                 "type": "frame",
                 "data": image_data,
@@ -660,35 +788,34 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
                 await websocket.send_text(json.dumps(payload))
                 frame_count += 1
             except WebSocketDisconnect:
-                logger.info(f"Stream {source_type} client disconnected during send")
+                logger.info(f"📡 Stream {source_type} client disconnected")
                 break
-            except RuntimeError as rt_err:
-                if "disconnect" in str(rt_err).lower():
-                    logger.info(f"Stream {source_type} disconnected (runtime error)")
+            except RuntimeError as e:
+                if "disconnect" in str(e).lower():
+                    logger.info(f"📡 Stream {source_type} disconnected")
                     break
-                else:
-                    logger.error(f"Failed to send frame: {rt_err}")
-                    break
+                logger.error(f"❌ Send error: {e}")
+                break
             except Exception as e:
-                logger.error(f"Failed to send frame: {e}")
+                logger.error(f"❌ Send error: {e}")
                 break
             
-            # Control frame rate - ~15-30 FPS
-            await asyncio.sleep(0.033)  # ~30 FPS
+            # Control frame rate (~30 FPS)
+            await asyncio.sleep(0.033)
             
     except WebSocketDisconnect:
-        logger.info(f"Stream {source_type} disconnected")
+        logger.info(f"📡 Stream {source_type} disconnected")
     except Exception as e:
-        logger.error(f"Stream error: {e}")
+        logger.error(f"❌ Stream error: {e}")
     finally:
         if camera:
             camera.release()
-        logger.info(f"Stream {source_type} closed")
+        logger.info(f"📡 Stream {source_type} closed")
 
 
+# ============================================================================
+# NO app.run() or if __name__ == "__main__" block
+# Railway will run: uvicorn src.api.main:app --host 0.0.0.0 --port $PORT
+# ============================================================================
 
-
-if __name__ == "__main__":
-    import uvicorn
-    # run on port 8000 to match frontend expectation
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+logger.info("🚀 Fire Detection API ready for Railway deployment")
