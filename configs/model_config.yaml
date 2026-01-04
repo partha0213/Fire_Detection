@@ -6,12 +6,21 @@ model:
 
 # Notification configuration
 notification:
+  # Email settings (Gmail recommended)
   smtp_server: "smtp.gmail.com"
   smtp_port: 587
   sender_email: "your_email@gmail.com"  # REPLACE WITH YOUR EMAIL
-  sender_password: "your_app_password"  # REPLACE WITH YOUR APP PASSWORD
-  receiver_emails: "receiver@example.com" # REPLACE WITH RECEIVER EMAIL
-  cooldown_seconds: 300  # 5 minutes
+  sender_password: "your_app_password"  # REPLACE WITH YOUR GMAIL APP PASSWORD
+  receiver_emails: "receiver@example.com,receiver2@example.com" # REPLACE WITH RECEIVER EMAILS
+  
+  # SMS settings (Twilio)
+  twilio_account_sid: "your_twilio_account_sid"  # REPLACE WITH TWILIO ACCOUNT SID
+  twilio_auth_token: "your_twilio_auth_token"    # REPLACE WITH TWILIO AUTH TOKEN
+  twilio_phone_number: "+1234567890"            # REPLACE WITH YOUR TWILIO PHONE NUMBER
+  receiver_phone_numbers: "+1234567890,+0987654321"  # REPLACE WITH RECEIVER PHONE NUMBERS
+  
+  # Alert cooldown (prevents spam)
+  cooldown_seconds: 300  # 5 minutes between alerts
 
 # Training configuration
 training:

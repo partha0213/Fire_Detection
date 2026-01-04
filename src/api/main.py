@@ -327,6 +327,51 @@ async def set_detection_threshold(data: Dict):
         "message": f"Fire detection threshold set to {threshold:.0%}"
     }
 
+@app.get("/notification-status")
+async def get_notification_status():
+    """Get status of notification system (email and SMS)."""
+    if not state.detector or not state.detector.notifier:
+        return {
+            "status": "not_initialized",
+            "message": "Notification system not initialized"
+        }
+    
+    status = state.detector.notifier.get_status()
+    return {
+        "status": "ok",
+        "notifications": status,
+        "message": "Notification system status retrieved"
+    }
+
+@app.post("/test-notification")
+async def test_notification():
+    """Send a test notification to configured email and SMS."""
+    if not state.detector or not state.detector.notifier:
+        raise HTTPException(status_code=503, detail="Notification system not initialized")
+    
+    try:
+        # Send test email and SMS
+        state.detector.notifier.send_fire_alert(
+            confidence=0.95,
+            location="TEST - Fire Detection System",
+            image_path=None
+        )
+        
+        status = state.detector.notifier.get_status()
+        return {
+            "status": "success",
+            "message": "Test notification sent",
+            "details": {
+                "email_sent": status["email_configured"],
+                "sms_sent": status["sms_configured"],
+                "email_recipients": status["email_recipients"],
+                "sms_recipients": status["sms_recipients"]
+            }
+        }
+    except Exception as e:
+        logger.error(f"Test notification failed: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send test notification: {str(e)}")
+
 @app.websocket("/ws/video")
 async def client_stream_detection(websocket: WebSocket):
     """

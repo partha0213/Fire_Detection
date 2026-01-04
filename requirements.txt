@@ -19,6 +19,10 @@ websockets>=11.0.0
 sqlalchemy>=2.0.0
 psycopg2-binary>=2.9.0
 
+# Notifications
+twilio>=8.10.0
+python-dotenv>=1.0.0
+
 # Utilities
 pyyaml
 tqdm
