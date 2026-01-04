@@ -98,6 +98,27 @@ async def startup_event():
         state.is_loaded = False
 
 # ==== Helper Functions ====
+def save_detection_to_db(fire_detected: bool, confidence: float, location: str = "Unknown", detections_list: List[Dict] = None):
+    """Save detection event to database."""
+    if not fire_detected or not SessionLocal:
+        return
+    
+    try:
+        db = SessionLocal()
+        event = DetectionEvent(
+            timestamp=datetime.utcnow(),
+            confidence=float(confidence),
+            class_name="Fire",
+            location=location,
+            metadata_json=json.dumps(detections_list or [])
+        )
+        db.add(event)
+        db.commit()
+        db.close()
+        logger.debug(f"Saved detection to DB: confidence={confidence:.2%}, location={location}")
+    except Exception as e:
+        logger.error(f"Failed to save to DB: {e}")
+
 def process_inference(image_np: np.ndarray, threshold: float = 0.5) -> DetectionResult:
     """Run inference using the loaded detector."""
     if not state.detector:
@@ -142,22 +163,8 @@ def process_inference(image_np: np.ndarray, threshold: float = 0.5) -> Detection
     
     
     # Save to Database if Fire Detected
-    if fire_detected and SessionLocal:
-        try:
-            db = SessionLocal()
-            event = DetectionEvent(
-                timestamp=datetime.utcnow(),
-                confidence=float(confidence),
-                class_name="Fire",
-                location="Camera 1", # Could come from config
-                metadata_json=json.dumps(detections_list)
-            )
-            db.add(event)
-            db.commit()
-            db.close()
-            # print("DEBUG: Saved detection to DB")
-        except Exception as e:
-            logger.error(f"Failed to save to DB: {e}")
+    if fire_detected:
+        save_detection_to_db(fire_detected, confidence, "Camera 1 (Upload)", detections_list)
 
     return DetectionResult(
         fire_detected=fire_detected,
@@ -441,6 +448,10 @@ async def client_stream_detection(websocket: WebSocket):
                         "frame_id": frame_count
                     }
                     
+                    # Save to database if fire detected (with rate limiting - every 5 frames)
+                    if fire_detected and frame_count % 5 == 0:  # ~5 FPS client send rate, so every 5 frames = ~1 second
+                        save_detection_to_db(fire_detected, confidence, "Laptop Camera", detection_boxes)
+                    
                     await websocket.send_text(json.dumps(response))
                     frame_count += 1
                 except Exception as send_err:
@@ -607,6 +618,10 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
                     status_color = (0, 0, 255) if fire_detected else (0, 255, 0)
                     cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
                     cv2.putText(frame, f"Confidence: {confidence:.1%}", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Save to database if fire detected (with rate limiting - only every 5 seconds)
+                    if fire_detected and frame_count % 150 == 0:  # ~30 FPS, so 150 frames = 5 seconds
+                        save_detection_to_db(fire_detected, confidence, f"{source_type.upper()} Stream", detection_boxes)
                 
                 # Encode with optimized compression
                 ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
