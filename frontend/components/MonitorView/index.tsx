@@ -2,6 +2,7 @@
 
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { Camera, Radio, Settings2, VideoOff, Play, Square, AlertTriangle, ShieldCheck, X, Link, Usb, Wifi } from 'lucide-react';
+import { getWebSocketUrl } from '../../lib/apiConfig';
 
 interface DetectionResult {
     fire_detected: boolean;
@@ -104,7 +105,8 @@ export const MonitorView: React.FC = () => {
             addLog(`Connecting to ${selectedCamera} stream...`, 'info');
 
             // Build WebSocket URL with source parameter for IP/RTSP cameras
-            let wsUrl = `ws://localhost:8000/ws/stream/${selectedCamera}`;
+            const wsBaseUrl = getWebSocketUrl();
+            let wsUrl = `${wsBaseUrl}/ws/stream/${selectedCamera}`;
             if ((selectedCamera === 'ip' || selectedCamera === 'rtsp') && source) {
                 wsUrl += `?url=${encodeURIComponent(source)}`;
             } else if (selectedCamera === 'usb' && source) {
@@ -203,7 +205,8 @@ export const MonitorView: React.FC = () => {
     // Connect WebSocket for client-side camera detection
     const connectClientWebSocket = () => {
         try {
-            const ws = new WebSocket('ws://localhost:8000/ws/video');
+            const wsUrl = getWebSocketUrl();
+            const ws = new WebSocket(`${wsUrl}/ws/video`);
 
             ws.onopen = () => {
                 addLog('Detection WebSocket connected', 'success');

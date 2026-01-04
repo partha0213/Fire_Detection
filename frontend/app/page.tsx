@@ -8,6 +8,7 @@ import { MonitorView } from '../components/MonitorView';
 import { AlertsView } from '../components/AlertsView';
 import { ProcessingView } from '../components/ProcessingView';
 import { DetectionResult, Alert, AppTab, ApiStatus } from '../types';
+import { getApiUrl } from '../lib/apiConfig';
 
 export default function Home() {
     const [activeTab, setActiveTab] = useState<AppTab>('detect');
@@ -28,8 +29,9 @@ export default function Home() {
     const checkHealth = useCallback(async () => {
         setApiStatus(prev => ({ ...prev, status: 'checking' }));
         const start = Date.now();
+        const apiUrl = getApiUrl();
         try {
-            const response = await fetch('http://localhost:8000/health', { signal: AbortSignal.timeout(5000) });
+            const response = await fetch(`${apiUrl}/health`, { signal: AbortSignal.timeout(5000) });
             const latency = Date.now() - start;
             if (response.ok) {
                 const data = await response.json();
@@ -58,7 +60,8 @@ export default function Home() {
         try {
             const formData = new FormData();
             formData.append('file', file);
-            const response = await fetch('http://localhost:8000/detect', {
+            const apiUrl = getApiUrl();
+            const response = await fetch(`${apiUrl}/detect`, {
                 method: 'POST',
                 body: formData,
             });
@@ -104,7 +107,8 @@ export default function Home() {
 
     const fetchAlerts = async () => {
         try {
-            const response = await fetch('http://localhost:8000/alerts');
+            const apiUrl = getApiUrl();
+            const response = await fetch(`${apiUrl}/alerts`);
             if (response.ok) {
                 const data = await response.json();
                 setAlerts(data.alerts || []);
