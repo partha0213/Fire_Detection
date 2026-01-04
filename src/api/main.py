@@ -76,6 +76,26 @@ class SimpleState:
 state = SimpleState()
 
 
+import asyncio
+
+
+@app.on_event("startup")
+async def warmup_model():
+    """Warm up YOLO model in background after startup to avoid blocking first request on Render."""
+    async def _load():
+        try:
+            logger.info("🔥 Warming up YOLO model in background...")
+            # Load model in a thread to avoid blocking event loop
+            await asyncio.to_thread(get_model)
+            state.model_loaded = True
+            logger.info("✅ YOLO model warmed up (background)")
+        except Exception as e:
+            logger.error(f"❌ Model warm-up failed: {e}")
+
+    # Schedule background warm-up task; do not await it here
+    asyncio.create_task(_load())
+
+
 # ============================================================================
 # PYDANTIC MODELS
 # ============================================================================
@@ -145,12 +165,15 @@ def process_inference(image_np, threshold: float = 0.5) -> DetectionResult:
     """
     Run fire detection inference on image.
     Uses singleton YOLO model from model_loader.
+    Loads model synchronously if not already warmed up (fallback for immediate requests).
     """
     model = get_model()
-    state.model_loaded = True  # Mark model as loaded after first successful call
-    
     if not model:
         raise HTTPException(status_code=503, detail="Model not initialized")
+    
+    # Update state after successful model loading
+    if not state.model_loaded:
+        state.model_loaded = True
 
     try:
         # Import numpy and PIL only when needed
@@ -444,7 +467,7 @@ async def client_stream_detection(websocket: WebSocket):
                 if not data:
                     continue
                 
-                # Lazy-load detector on first frame
+                # Ensure model is loaded (fallback to synchronous loading if warm-up didn't complete)
                 if detector is None:
                     logger.info("⏳ Loading model for client stream...")
                     detector = get_model()
@@ -453,6 +476,7 @@ async def client_stream_detection(websocket: WebSocket):
                             "error": "Model failed to load"
                         }))
                         break
+                    state.model_loaded = True
                 
                 try:
                     # Decode base64 frame
@@ -555,25 +579,24 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
     """
     Server-side WebSocket (IP/USB/RTSP Camera Mode).
     Opens camera on server → Runs inference → Sends annotated frames.
-    
-    Model is lazy-loaded on first frame.
+
+    Model is warmed in background on startup; do not load synchronously here.
     """
     await websocket.accept()
-    
-    # Get camera source from query params
+
     url_param = websocket.query_params.get('url')
     device_param = websocket.query_params.get('device')
-    
+
     logger.info(f"📡 Server stream connected: type={source_type}, url={url_param}")
-    
-    # Send handshake
+
+    # Handshake
     await websocket.send_text(json.dumps({
         "type": "status",
         "status": "connected",
         "message": f"Connected to {source_type} stream"
     }))
-    
-    # Determine camera source
+
+    # Resolve camera source
     camera_source = None
     if source_type == 'usb':
         camera_source = int(device_param) if device_param else 0
@@ -581,75 +604,68 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
         if url_param:
             camera_source = url_param
         else:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "error": "IP camera URL required"
-            }))
+            await websocket.send_text(json.dumps({"type": "error", "error": "IP camera URL required"}))
             return
     elif source_type == 'rtsp':
         if url_param:
             camera_source = url_param
         else:
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "error": "RTSP stream URL required"
-            }))
+            await websocket.send_text(json.dumps({"type": "error", "error": "RTSP stream URL required"}))
             return
-    else:
+
+    # Fallback to local camera
+    if camera_source is None:
         camera_source = 0
-    
+
     import cv2
     import numpy as np
-    
+
     camera = None
     frame_count = 0
     detector = None
-    
+
     try:
         # Open camera
         if camera_source is not None:
             camera = cv2.VideoCapture(camera_source)
-            
             if isinstance(camera_source, str):
                 camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            
+
             if not camera.isOpened():
                 logger.error(f"❌ Could not open {source_type}: {camera_source}")
-                await websocket.send_text(json.dumps({
-                    "type": "error",
-                    "error": f"Failed to connect to {source_type} camera"
-                }))
-                # Keep connection open
+                await websocket.send_text(json.dumps({"type": "error", "error": f"Failed to connect to {source_type} camera"}))
+                # Keep connection open but idle
                 while True:
                     await asyncio.sleep(1)
                 return
-            
+
             logger.info(f"✅ {source_type.upper()} camera opened")
-        
+
         # Stream loop
         while True:
             fire_detected = False
             confidence = 0.0
             detection_boxes = []
             frame = None
-            
+
             if camera and camera.isOpened():
                 success, frame = camera.read()
                 if not success:
                     logger.warning(f"⚠️  Failed to read frame from {source_type}")
                     break
-                
-                # Lazy-load detector on first frame
+
+                # Ensure model is loaded (fallback to synchronous loading if warm-up didn't complete)
                 if detector is None:
                     logger.info("⏳ Loading model for server stream...")
                     detector = get_model()
                     if not detector:
-                        logger.error("❌ Failed to load model")
+                        logger.error("❌ Failed to acquire model")
                         break
-                
+                    state.model_loaded = True
+
                 # Run inference
                 yolo_results = detector.predict(frame, conf=0.5, verbose=False)
-                
+
                 if yolo_results and len(yolo_results) > 0:
                     result = yolo_results[0]
                     if result.boxes is not None and len(result.boxes) > 0:
@@ -659,81 +675,24 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
                                 xyxy = box.xyxy[0].cpu().numpy().astype(int)
                                 conf = float(box.conf[0])
                                 confidence = max(confidence, conf)
-                                detection_boxes.append({
-                                    'xyxy': [int(x) for x in xyxy],
-                                    'confidence': conf
-                                })
+                                detection_boxes.append({'xyxy': [int(x) for x in xyxy], 'confidence': conf})
                             except Exception as e:
                                 logger.error(f"Error processing box: {e}")
-                
-                # Draw annotations on frame
-                color = (0, 0, 255) if fire_detected else (0, 255, 0)
-                if detection_boxes:
-                    for box_info in detection_boxes:
-                        xyxy = box_info['xyxy']
-                        conf_val = box_info['confidence']
-                        cv2.rectangle(
-                            frame,
-                            (xyxy[0], xyxy[1]),
-                            (xyxy[2], xyxy[3]),
-                            color, 2
-                        )
-                        label = f"FIRE {conf_val:.0%}"
-                        cv2.putText(
-                            frame, label,
-                            (xyxy[0], xyxy[1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2
-                        )
-                
-                # Status overlay
-                status_text = "🔥 FIRE DETECTED" if fire_detected else "✅ Area Clear"
-                status_color = (0, 0, 255) if fire_detected else (0, 255, 0)
-                cv2.putText(
-                    frame, status_text,
-                    (10, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2
-                )
-                cv2.putText(
-                    frame, f"Confidence: {confidence:.1%}",
-                    (10, 60),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1
-                )
-                
-                # Save to database (rate-limited)
-                if fire_detected and frame_count % 150 == 0:
-                    save_detection_to_db(
-                        fire_detected, confidence,
-                        f"{source_type.upper()} Stream",
-                        detection_boxes
-                    )
-                
             else:
                 # No camera: send placeholder
                 frame = np.zeros((480, 640, 3), dtype=np.uint8)
-                cv2.putText(
-                    frame, f"NO SOURCE FOR {source_type.upper()}",
-                    (50, 240),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2
-                )
-                cv2.putText(
-                    frame, "Check camera configuration",
-                    (50, 300),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1
-                )
+                cv2.putText(frame, f"NO SOURCE FOR {source_type.upper()}", (50, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+                cv2.putText(frame, "Check camera configuration", (50, 300), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (200, 200, 200), 1)
                 await asyncio.sleep(0.5)
-            
-            # Encode frame
-            if frame is not None:
-                ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                if not ret or buffer is None:
-                    logger.error("❌ Frame encoding failed")
-                    continue
-                
-                frame_b64 = base64.b64encode(buffer).decode('utf-8')
-                image_data = f"data:image/jpeg;base64,{frame_b64}"
-            else:
+
+            # Encode frame as base64 JPEG
+            try:
+                _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                image_data = base64.b64encode(buffer).decode('utf-8')
+            except Exception as e:
+                logger.error(f"Frame encoding error: {e}")
                 continue
-            
+
             # Send payload
             payload = {
                 "type": "frame",
@@ -747,7 +706,7 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
                     "boxes": detection_boxes
                 }
             }
-            
+
             try:
                 await websocket.send_text(json.dumps(payload))
                 frame_count += 1
@@ -763,10 +722,10 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
             except Exception as e:
                 logger.error(f"❌ Send error: {e}")
                 break
-            
+
             # Control frame rate (~30 FPS)
             await asyncio.sleep(0.033)
-            
+
     except WebSocketDisconnect:
         logger.info(f"📡 Stream {source_type} disconnected")
     except Exception as e:
@@ -775,6 +734,7 @@ async def server_stream_feed(websocket: WebSocket, source_type: str):
         if camera:
             camera.release()
         logger.info(f"📡 Stream {source_type} closed")
+
 
 
 # ============================================================================
